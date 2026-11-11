@@ -109,6 +109,11 @@
     vuLevel: 0,
   };
 
+  // Audio slice length. Every millisecond here is added end-to-end latency,
+  // because a slice can't be relayed until it's complete.
+  // 120 ms is the sweet spot: noticeably live, still efficient to encode.
+  const SLICE_MS = 120;
+
   // diagnostics, handy for debugging a link between two devices
   const D = window.__TWO_RADIO = {
     rx: 0, pushed: 0, got: 0, mode: '', mime: '',
@@ -182,12 +187,24 @@
       let peak = 0;
       for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
       level = Math.min(1, peak * 2.4);
+    } else if (S.talker && S.talker.id !== S.me?.id) {
+      const real = Receiver.level();
+      if (real > 0.02) { level = real; S.vuPulse = Math.max(S.vuPulse, real); }
+      else { S.vuPulse *= 0.88; level = Math.min(1, S.vuPulse * 0.9); }
     } else {
-      S.vuPulse *= 0.88;                       // decay tail after each chunk
-      level = Math.min(1, S.vuPulse * 0.9);
+      S.vuPulse *= 0.9;
+      level = 0;
     }
     S.vuLevel += (level - S.vuLevel) * 0.35;
     paintVu(S.vuLevel);
+
+    // Someone is transmitting but nothing has arrived for a while: say so,
+    // instead of leaving the user wondering why it's silent.
+    if (S.talker && !S.muted) {
+      const stale = S.lastAudioAt > 0 && Date.now() - S.lastAudioAt > 2500;
+      if (stale !== S._stale) { S._stale = stale; setStaleNote(stale); }
+    }
+
     requestAnimationFrame(vuLoop);
   }
 
@@ -227,7 +244,8 @@
       setStatus('rx', 'RX');
       el.pttText.textContent = 'HOLD';
       el.pttHint.textContent = 'channel busy';
-      el.stageNote.innerHTML = `<i>${escapeHtml(S.talker.name)}</i> is talking`;
+      setTalkerNote(!S.lastAudioAt || Date.now() - S.lastAudioAt > 800);
+      S._stale = false;
     } else {
       setStatus('', 'STANDBY');
       el.pttText.textContent = S.joined ? (S.handsFree ? 'TAP' : 'HOLD') : 'JOIN';
@@ -295,6 +313,24 @@
     if (typeof drawDial === 'function') drawDial();
   }
 
+
+  /** Talker status line; `waiting` shows a subtle "no audio yet" hint. */
+  function setTalkerNote(waiting) {
+    if (!S.talker) return;
+    const name = escapeHtml(S.talker.name);
+    el.stageNote.innerHTML = waiting
+      ? `<i>${name}</i> is talking <span style="opacity:.55">(connecting audio…)</span>`
+      : `<i>${name}</i> is talking`;
+  }
+
+  /** Called when a talker has been transmitting with nothing arriving. */
+  function setStaleNote(stale) {
+    if (!S.talker) return;
+    const name = escapeHtml(S.talker.name);
+    el.stageNote.innerHTML = stale
+      ? `<i>${name}</i> is keyed up <span style="color:var(--red)">— no audio arriving</span>`
+      : `<i>${name}</i> is talking`;
+  }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -455,6 +491,8 @@
       case 'busy': {
         if (S.me && msg.by.id === S.me.id) break;   // our own echo
         S.talker = { id: msg.by.id, name: msg.by.name };
+        S.lastAudioAt = 0;
+        S._stale = false;
         S.tx = false;                                // half duplex: stop our output
         Receiver.begin(msg.mime);
         buzz(18);
@@ -470,6 +508,8 @@
 
       case 'audio':
         D.rx++;
+        S.lastAudioAt = Date.now();
+        if (S.talker) setTalkerNote(false);
         if (S.muted) return;
         S.vuPulse = Math.min(1, S.vuPulse + 0.45);
         Receiver.push(msg.data);
@@ -668,6 +708,7 @@
 
     function push(b64) {
       D.pushed++;
+      if (D.pushed === 1 && D.firstChunkAt === 0) D.firstChunkAt = performance.now();
       let bin;
       try { bin = atob(b64); } catch { return; }
       const bytes = new Uint8Array(bin.length);
@@ -703,6 +744,15 @@
       }
       draining = false;
       if (pending.length) queueMicrotask(drain);
+
+      // Stay at the live edge. Without this the buffer creeps forward and the
+      // delay grows into seconds over a long transmission.
+      try {
+        if (audio.buffered.length) {
+          const edge = audio.buffered.end(audio.buffered.length - 1);
+          if (edge - audio.currentTime > 0.6) audio.currentTime = edge - 0.15;
+        }
+      } catch { /* noop */ }
     }
 
     let blobTimer = null;
@@ -748,8 +798,34 @@
       close();
     }
 
+    /** Peak level of what is actually playing (0..1). */
+    function level() {
+      try {
+        if (!rxCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return 0;
+          rxCtx = new AC();
+          rxSource = rxCtx.createMediaElementSource(audio);
+          rxAnalyser = rxCtx.createAnalyser();
+          rxAnalyser.fftSize = 512;
+          rxSource.connect(rxAnalyser);
+          rxAnalyser.connect(rxCtx.destination);   // keep the audio audible
+        }
+        if (rxCtx.state === 'suspended') { rxCtx.resume().catch(() => {}); }
+        const buf = new Uint8Array(rxAnalyser.fftSize);
+        rxAnalyser.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+        return Math.min(1, peak * 2.4);
+      } catch {
+        return 0;      // analyser unavailable (some iOS versions): meter falls back
+      }
+    }
+
+    let rxCtx = null, rxSource = null, rxAnalyser = null;
+
     audio.addEventListener('click', unlock);
-    return { begin, push, end, unlock, element: audio };
+    return { begin, push, end, unlock, element: audio, level, get playing() { return !audio.paused; } };
   })();
 
   /* ============================================================
@@ -877,7 +953,7 @@
       // stop is always followed by the release so the channel frees up
       send({ t: 'ptt', on: false });
     };
-    rec.start(250);            // ~250 ms slices = snappy relay
+    rec.start(SLICE_MS);       // short slices = low latency; see SLICE_MS
     S.recorder = rec;
   }
 
