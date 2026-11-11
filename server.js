@@ -179,6 +179,22 @@ function normalizeFrequency(value) {
 /** Put a member on a channel and tell everybody involved. */
 function joinChannel(member, freq) {
   const target = getChannel(freq);
+
+  // A reconnecting client often arrives before its old socket is reaped.
+  // Evict the previous incarnation so the roster doesn't show the name twice.
+  for (const other of [...target.members.values()]) {
+    const sameGuy = other.name.toLowerCase() === member.name.toLowerCase()
+      && other.color === member.color
+      && other.ws.readyState !== 1;
+    if (sameGuy) {
+      if (target.talker && target.talker.id === other.id) {
+        target.talker = null;
+        broadcast(target, { t: 'free', by: { id: other.id, name: other.name } }, other.id);
+      }
+      target.members.delete(other.id);
+    }
+  }
+
   target.members.set(member.id, member);
 
   send(member.ws, {
@@ -358,6 +374,23 @@ wss.on('connection', (ws) => {
   ws.on('error', () => { /* close handler cleans up */ });
 });
 
+// Remove members whose socket died without a close frame. Reloading a tab on a
+// flaky connection can leave the old connection half-open; without this sweep the
+// same callsign appears twice in the roster.
+const reaper = setInterval(() => {
+  const now = Date.now();
+  for (const ch of channels.values()) {
+    for (const m of [...ch.members.values()]) {
+      const dead = m.ws.readyState !== 1;
+      const silent = now - m.lastSeen > 45000;
+      if (dead || silent) {
+        if (m.ws.readyState === 1) { try { m.ws.terminate(); } catch { /* noop */ } }
+        leaveChannel(m, ch);
+      }
+    }
+  }
+}, 10000);
+
 // Keep dead sockets from squatting on the channel lock.
 const heartbeat = setInterval(() => {
   for (const ws of wss.clients) {
@@ -366,7 +399,7 @@ const heartbeat = setInterval(() => {
     try { ws.ping(); } catch { /* noop */ }
   }
 }, 30000);
-wss.on('close', () => clearInterval(heartbeat));
+wss.on('close', () => { clearInterval(heartbeat); clearInterval(reaper); });
 
 server.listen(PORT, HOST, () => {
   console.log(`TWO RADIO listening on http://${HOST}:${PORT}`);
