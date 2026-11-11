@@ -1,0 +1,17 @@
+{
+  "name": "two-radio",
+  "version": "1.0.0",
+  "description": "TWO RADIO — half-duplex push-to-talk radio in the browser. One talker per channel.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.22.2"
+  },
+  "license": "MIT"
+}
