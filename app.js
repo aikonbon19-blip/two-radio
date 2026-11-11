@@ -415,13 +415,16 @@
       handle(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
+      const wasTalking = S.tx || S.pttDown || S.handsFree;
       S.ws = null;
       S.joined = false;
-      S.tx = false;
       S.talker = null;
+      clearInterval(S.keepalive);
+      if (wasTalking) hardStopTx(); else { S.tx = false; S.pttDown = false; }
       setLink('offline');
       paintUi();
+      if (wasTalking) toast('Link dropped — reconnecting', 2200);
       if (S.intent.callsign) scheduleReconnect();
     };
 
@@ -430,12 +433,20 @@
 
   function scheduleReconnect() {
     if (S.reconnectTimer) return;
-    const delay = Math.min(8000, 600 * 2 ** S.retry++);
+    const delay = Math.min(6000, 300 * 2 ** S.retry++);
     setLink('offline');
     S.reconnectTimer = setTimeout(() => {
       S.reconnectTimer = null;
       if (S.intent.callsign) connect();
     }, delay);
+  }
+
+  /** Ping the server periodically: keeps proxies from culling an idle socket. */
+  function startKeepalive() {
+    clearInterval(S.keepalive);
+    S.keepalive = setInterval(() => {
+      if (S.ws && S.ws.readyState === 1) send({ t: 'ping' });
+    }, 20000);
   }
 
   function send(msg) {
@@ -462,7 +473,22 @@
           S.talker = null;
         }
         el.sheet.hidden = true;
+        startKeepalive();
         paintUi();
+
+        // If the link dropped mid-sentence, pick the sentence back up.
+        if (S.resumeTx) {
+          S.resumeTx = false;
+          const held = S.holdWhileDown;
+          const handsFree = S.resumeHandsFree;
+          S.resumeHandsFree = false;
+          if (held || handsFree) {
+            if (handsFree) S.handsFree = true;
+            setTimeout(() => {
+              if (S.joined && !S.tx) startTx();
+            }, 250);
+          }
+        }
         break;
       }
 
@@ -911,6 +937,13 @@
     const stream = S.micStream;
     if (!stream || typeof MediaRecorder === 'undefined') return;
 
+    // A dropped link used to leave the old recorder running, so re-keying
+    // created a second recorder on the same stream and sent every slice twice.
+    if (S.recorder && S.recorder.state === 'recording') {
+      try { S.recorder.onstop = null; S.recorder.stop(); } catch { /* noop */ }
+    }
+    S.recorder = null;
+
     // meter
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -955,6 +988,22 @@
     };
     rec.start(SLICE_MS);       // short slices = low latency; see SLICE_MS
     S.recorder = rec;
+  }
+
+  /** Stop capture without touching the network. Used when the link drops. */
+  function hardStopTx() {
+    S.resumeTx = !!(S.pttDown || S.handsFree || S.holdWhileDown);
+    S.wasHandsFree = S.handsFree;
+    const rec = S.recorder;
+    S.recorder = null;
+    if (rec) {
+      try { rec.onstop = null; rec.stop(); } catch { /* noop */ }
+    }
+    S.tx = false;
+    S.pttDown = false;
+    S.handsFree = false;
+    if (S.wasHandsFree) S.resumeHandsFree = true;
+    paintUi();
   }
 
   function stopTx() {
@@ -1002,10 +1051,14 @@
     }
 
     pressStartedTx = true;
+    S.holdWhileDown = true;
     startTx();
   }
 
   function pttUp() {
+    S.holdWhileDown = false;
+    S.resumeTx = false;
+    S.resumeHandsFree = false;
     if (!pressStartedTx) return;
     pressStartedTx = false;
     if (S.handsFree) return;          // stay on air
