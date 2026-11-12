@@ -13,6 +13,8 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const https = require('https');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
@@ -44,7 +46,49 @@ const MIME = {
  * HTTP: static files
  * ------------------------------------------------------------------ */
 
-const server = http.createServer((req, res) => {
+/** Every non-internal IPv4 address, for printing shareable LAN links. */
+function lanAddresses() {
+  const out = [];
+  for (const list of Object.values(os.networkInterfaces())) {
+    for (const ni of list || []) {
+      if (ni.family === 'IPv4' && !ni.internal) out.push(ni.address);
+    }
+  }
+  return out;
+}
+
+/** A self-signed certificate, generated once and kept in .certs/. */
+function selfSignedCert() {
+  const dir = path.join(__dirname, '.certs');
+  const keyFile = path.join(dir, 'key.pem');
+  const crtFile = path.join(dir, 'cert.pem');
+  if (fs.existsSync(keyFile) && fs.existsSync(crtFile)) {
+    return { key: fs.readFileSync(keyFile), cert: fs.readFileSync(crtFile) };
+  }
+  let selfsigned;
+  try { selfsigned = require('selfsigned'); } catch {
+    console.error('LAN mode needs the "selfsigned" package: npm install selfsigned');
+    process.exit(1);
+  }
+  const ips = ['127.0.0.1', ...lanAddresses()];
+  const altNames = [
+    { type: 2, value: 'localhost' },
+    { type: 2, value: 'two-radio.local' },
+    ...ips.map((ip) => ({ type: 7, ip })),
+  ];
+  const pems = selfsigned.generate(
+    [{ name: 'commonName', value: 'two-radio.local' }],
+    { days: 3650, keySize: 2048, algorithm: 'sha256', extensions: [{ name: 'subjectAltName', altNames }] }
+  );
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(keyFile, pems.private); // gitignored
+    fs.writeFileSync(crtFile, pems.cert);
+  } catch { /* running on a read-only filesystem: fine, keep in memory */ }
+  return { key: pems.private, cert: pems.cert };
+}
+
+const requestHandler = (req, res) => {
   const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
 
   if (url.pathname === '/health') {
@@ -94,7 +138,7 @@ const server = http.createServer((req, res) => {
     });
     res.end(buf);
   });
-});
+};
 
 /* ------------------------------------------------------------------ *
  * Channels — in-memory radio state
@@ -238,6 +282,20 @@ function rateOk(member) {
  * ------------------------------------------------------------------ */
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 512 * 1024 });
+
+/* LAN mode serves HTTPS. A phone will only grant microphone access to an https://
+   origin, so a bare http://192.168.x.x address cannot do push-to-talk at all.
+   The certificate is self-signed: each phone shows a one-time warning. */
+const LAN_MODE = process.env.LAN === '1' || process.env.LAN === 'true';
+
+const server = LAN_MODE
+  ? (() => {
+      const tls = selfSignedCert();
+      const s = https.createServer({ key: tls.key, cert: tls.cert }, requestHandler);
+      s.on('clientError', (err, socket) => { try { socket.destroy(); } catch { /* noop */ } });
+      return s;
+    })()
+  : http.createServer(requestHandler);
 
 server.on('upgrade', (req, socket, head) => {
   let pathname = '/';
@@ -402,6 +460,22 @@ const heartbeat = setInterval(() => {
 wss.on('close', () => { clearInterval(heartbeat); clearInterval(reaper); });
 
 server.listen(PORT, HOST, () => {
-  console.log(`TWO RADIO listening on http://${HOST}:${PORT}`);
+  const scheme = LAN_MODE ? 'https' : 'http';
+  console.log(`TWO RADIO listening on ${scheme}://${HOST}:${PORT}`);
   console.log('frequencies: ' + PMR446.join(' '));
+
+  if (LAN_MODE) {
+    console.log('');
+    console.log('LAN MODE — phones on the same Wi-Fi can talk with no internet:');
+    for (const ip of lanAddresses()) {
+      console.log(`   ${scheme}://${ip}:${PORT}`);
+    }
+    console.log('');
+    console.log('Each phone will show "Your connection is not private" once.');
+    console.log('Tap Advanced -> Proceed. That is expected for a self-signed certificate.');
+  } else {
+    for (const ip of lanAddresses()) {
+      console.log(`   (LAN preview: http://${ip}:${PORT} — microphone needs LAN=1 for HTTPS)`);
+    }
+  }
 });

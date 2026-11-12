@@ -24,6 +24,10 @@
     dial: $('dial'),
     dialTick: $('dialTick'),
     startFreq: $('startFreq'),
+    netModes: $('netModes'),
+    localField: $('localField'),
+    localServer: $('localServer'),
+    netIcoPath: $('netIcoPath'),
     quickFreqs: $('quickFreqs'),
     presetList: $('presetList'),
     bandList: $('bandList'),
@@ -89,6 +93,7 @@
     ws: null,
     joined: false,
     intent: { callsign: '', freq: '446.00625', color: COLORS[0] },
+    net: { mode: 'online', server: '' },   // 'online' | 'local'
     freq: '446.00625',      // what we're tuned to
     scan: { on: false, timer: null, idx: 0, results: [], wait: 0 },
     me: null,               // { id, name, color }
@@ -223,8 +228,11 @@
 
   /* ---------------------------- ui paint --------------------------- */
   function setLink(state) {
-    el.linkState.className = 'link-state ' + state;
-    el.linkText.textContent = state === 'online' ? 'ON AIR' : state === 'offline' ? 'NO LINK' : 'CONNECTING';
+    el.linkState.className = 'link-state ' + state + (S.net.mode === 'local' ? ' local-mode' : '');
+    const internet = state === 'online';
+    el.linkText.textContent = internet
+      ? (S.net.mode === 'local' ? 'LOCAL' : 'ON AIR')
+      : state === 'offline' ? 'NO LINK' : 'CONNECTING';
   }
 
   function setStatus(kind, text) {
@@ -300,6 +308,7 @@
     el.chSub.textContent = S.joined
       ? [
           chNo ? `CH ${chNo}` : 'VFO',
+          S.net.mode === 'local' ? 'OFFLINE' : 'ONLINE',
           `${S.members.length} OPERATOR${S.members.length === 1 ? '' : 'S'}`,
           S.muted ? 'MUTED' : 'LIVE',
         ].join(' · ')
@@ -357,6 +366,7 @@
     try {
       localStorage.setItem('two-radio:prefs', JSON.stringify({
         callsign: S.intent.callsign, freq: S.intent.freq, color: S.intent.color,
+        mode: S.net.mode, server: S.net.server,
       }));
     } catch { /* private mode */ }
   }
@@ -367,6 +377,8 @@
       const p = JSON.parse(raw);
       if (p.callsign) el.callsign.value = p.callsign;
       if (p.freq) el.startFreq.value = normFreq(p.freq);
+      if (p.server) { S.net.server = p.server; el.localServer.value = p.server; }
+      if (p.mode === 'local' || p.mode === 'online') S.net.mode = p.mode;
       if (p.color && COLORS.includes(p.color)) {
         chosenColor = p.color;
         [...el.swatches.children].forEach((n) => n.setAttribute('aria-checked',
@@ -380,8 +392,89 @@
     return '#' + m.slice(0, 3).map((n) => Number(n).toString(16).padStart(2, '0')).join('');
   }
 
+  /* ----------------------- online / offline ----------------------- */
+  function paintMode() {
+    [...el.netModes.children].forEach((b) => {
+      b.setAttribute('aria-checked', String(b.dataset.mode === S.net.mode));
+    });
+    el.localField.hidden = S.net.mode !== 'local';
+
+    const local = S.net.mode === 'local';
+    el.linkState.classList.toggle('local-mode', local);
+    el.linkState.title = local ? 'Offline mode — same Wi-Fi only' : 'Online mode — works anywhere';
+  }
+
+  el.netModes.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mode');
+    if (!btn) return;
+    S.net.mode = btn.dataset.mode;
+    if (S.net.mode === 'local' && !S.net.server) {
+      // a sane default so the field is never empty
+      el.localServer.value = el.localServer.value || '192.168.1.20:3000';
+      S.net.server = cleanHost(el.localServer.value);
+      setTimeout(() => el.localServer.focus(), 60);
+    }
+    paintMode();
+    savePrefs();
+  });
+
+  el.localServer.addEventListener('input', () => {
+    S.net.server = cleanHost(el.localServer.value);
+    savePrefs();
+  });
+
+  /** Switching network while connected: drop and rejoin on the other transport. */
+  function switchNetwork(mode) {
+    if (S.net.mode === mode) return;
+    S.net.mode = mode;
+    paintMode();
+    savePrefs();
+    if (!S.joined) return;
+
+    if (S.tx) stopTx();
+    try { S.ws && S.ws.close(); } catch { /* noop */ }
+    S.ws = null;
+    S.joined = false;
+    clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = null;
+    setLink('connecting');
+    setTimeout(connect, 150);
+  }
+
+  el.linkState.addEventListener('click', () => {
+    if (!S.joined) { el.joinSheet.hidden = false; paintMode(); return; }
+    switchNetwork(S.net.mode === 'online' ? 'local' : 'online');
+    toast(S.net.mode === 'local'
+      ? 'Offline mode — searching for the local server'
+      : 'Online mode — reconnecting to the internet server', 2600);
+  });
+
   /* --------------------------- websocket --------------------------- */
+  /** "https://192.168.1.5:3000/" -> { host: "192.168.1.5:3000", scheme: "wss" } */
+  function parseServer(raw) {
+    const s = String(raw || '').trim();
+    let scheme = null;
+    if (/^https:\/\//i.test(s)) scheme = 'wss';
+    else if (/^http:\/\//i.test(s)) scheme = 'ws';
+    const host = s
+      .replace(/^wss?:\/\//i, '')
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '')
+      .replace(/\s+/g, '');
+    return { host, scheme };
+  }
+
+  function cleanHost(raw) { return parseServer(raw).host; }
+
   function wsUrl() {
+    if (S.net.mode === 'local' && S.net.server) {
+      // Offline mode: talk to the host PC directly, no internet involved.
+      const { host, scheme } = parseServer(S.net.server);
+      // LAN mode serves HTTPS, so wss is the default. S.net.flip forces ws,
+      // which is what a plain-HTTP host needs — tried automatically on failure.
+      const proto = scheme || (S.net.flip ? 'ws' : 'wss');
+      return `${proto}://${host}/ws`;
+    }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${location.host}/ws`;
   }
@@ -415,6 +508,7 @@
       handle(msg);
     };
 
+    ws.onerror = null;   // handled in onclose
     ws.onclose = (ev) => {
       const wasTalking = S.tx || S.pttDown || S.handsFree;
       S.ws = null;
@@ -422,9 +516,19 @@
       S.talker = null;
       clearInterval(S.keepalive);
       if (wasTalking) hardStopTx(); else { S.tx = false; S.pttDown = false; }
+      // Offline mode with no explicit scheme: the host may be plain HTTP.
+      // Flip the transport once before complaining.
+      if (S.net.mode === 'local' && !parseServer(S.net.server).scheme && S.retry === 0) {
+        S.net.flip = !S.net.flip;
+      }
+
       setLink('offline');
       paintUi();
-      if (wasTalking) toast('Link dropped — reconnecting', 2200);
+      if (S.net.mode === 'local' && S.retry >= 1) {
+        toast(`No local server at ${cleanHost(S.net.server)} — check the address and the Wi-Fi`, 4000);
+      } else if (wasTalking) {
+        toast('Link dropped — reconnecting', 2200);
+      }
       if (S.intent.callsign) scheduleReconnect();
     };
 
@@ -473,6 +577,7 @@
           S.talker = null;
         }
         el.sheet.hidden = true;
+        S.retry = 0;                     // connected: clear the failure counter
         startKeepalive();
         paintUi();
 
@@ -1334,6 +1439,16 @@
     const freq = normFreq(el.startFreq.value);
     if (!callsign) { el.callsign.focus(); return; }
 
+    if (S.net.mode === 'local') {
+      S.net.server = cleanHost(el.localServer.value);
+      if (!S.net.server) {
+        toast('Enter the local server address printed by the host PC', 3200);
+        el.localServer.focus();
+        return;
+      }
+      el.localServer.value = S.net.server;
+    }
+
     const sameChannel = S.joined && S.freq === freq;
     el.startFreq.value = freq;
     S.freq = freq;
@@ -1395,6 +1510,8 @@
   });
 
   el.startFreq.value = normFreq(el.startFreq.value || '446.00625');
+  if (S.net.server) el.localServer.value = S.net.server;
+  paintMode();
 
   paintUi();
   vuLoop();
