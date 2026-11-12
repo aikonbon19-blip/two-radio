@@ -1,7 +1,7 @@
 /* TWO RADIO — offline shell.
    Caches the app so it launches from the phone's home screen instantly,
    even on a bad connection. Audio always goes live over the socket. */
-const CACHE = 'two-radio-v3';
+const CACHE = 'two-radio-v7';
 const SHELL = [
   '/',
   '/index.html',

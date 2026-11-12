@@ -24,6 +24,10 @@
     dial: $('dial'),
     dialTick: $('dialTick'),
     startFreq: $('startFreq'),
+    netModes: $('netModes'),
+    localField: $('localField'),
+    localServer: $('localServer'),
+    netIcoPath: $('netIcoPath'),
     quickFreqs: $('quickFreqs'),
     presetList: $('presetList'),
     bandList: $('bandList'),
@@ -89,6 +93,7 @@
     ws: null,
     joined: false,
     intent: { callsign: '', freq: '446.00625', color: COLORS[0] },
+    net: { mode: 'online', server: '' },   // 'online' | 'local'
     freq: '446.00625',      // what we're tuned to
     scan: { on: false, timer: null, idx: 0, results: [], wait: 0 },
     me: null,               // { id, name, color }
@@ -108,6 +113,11 @@
     vuPulse: 0,             // 0..1 decayed level for RX
     vuLevel: 0,
   };
+
+  // Audio slice length. Every millisecond here is added end-to-end latency,
+  // because a slice can't be relayed until it's complete.
+  // 120 ms is the sweet spot: noticeably live, still efficient to encode.
+  const SLICE_MS = 120;
 
   // diagnostics, handy for debugging a link between two devices
   const D = window.__TWO_RADIO = {
@@ -182,12 +192,24 @@
       let peak = 0;
       for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
       level = Math.min(1, peak * 2.4);
+    } else if (S.talker && S.talker.id !== S.me?.id) {
+      const real = Receiver.level();
+      if (real > 0.02) { level = real; S.vuPulse = Math.max(S.vuPulse, real); }
+      else { S.vuPulse *= 0.88; level = Math.min(1, S.vuPulse * 0.9); }
     } else {
-      S.vuPulse *= 0.88;                       // decay tail after each chunk
-      level = Math.min(1, S.vuPulse * 0.9);
+      S.vuPulse *= 0.9;
+      level = 0;
     }
     S.vuLevel += (level - S.vuLevel) * 0.35;
     paintVu(S.vuLevel);
+
+    // Someone is transmitting but nothing has arrived for a while: say so,
+    // instead of leaving the user wondering why it's silent.
+    if (S.talker && !S.muted) {
+      const stale = S.lastAudioAt > 0 && Date.now() - S.lastAudioAt > 2500;
+      if (stale !== S._stale) { S._stale = stale; setStaleNote(stale); }
+    }
+
     requestAnimationFrame(vuLoop);
   }
 
@@ -206,8 +228,11 @@
 
   /* ---------------------------- ui paint --------------------------- */
   function setLink(state) {
-    el.linkState.className = 'link-state ' + state;
-    el.linkText.textContent = state === 'online' ? 'ON AIR' : state === 'offline' ? 'NO LINK' : 'CONNECTING';
+    el.linkState.className = 'link-state ' + state + (S.net.mode === 'local' ? ' local-mode' : '');
+    const internet = state === 'online';
+    el.linkText.textContent = internet
+      ? (S.net.mode === 'local' ? 'LOCAL' : 'ON AIR')
+      : state === 'offline' ? 'NO LINK' : 'CONNECTING';
   }
 
   function setStatus(kind, text) {
@@ -227,7 +252,8 @@
       setStatus('rx', 'RX');
       el.pttText.textContent = 'HOLD';
       el.pttHint.textContent = 'channel busy';
-      el.stageNote.innerHTML = `<i>${escapeHtml(S.talker.name)}</i> is talking`;
+      setTalkerNote(!S.lastAudioAt || Date.now() - S.lastAudioAt > 800);
+      S._stale = false;
     } else {
       setStatus('', 'STANDBY');
       el.pttText.textContent = S.joined ? (S.handsFree ? 'TAP' : 'HOLD') : 'JOIN';
@@ -282,6 +308,7 @@
     el.chSub.textContent = S.joined
       ? [
           chNo ? `CH ${chNo}` : 'VFO',
+          S.net.mode === 'local' ? 'OFFLINE' : 'ONLINE',
           `${S.members.length} OPERATOR${S.members.length === 1 ? '' : 'S'}`,
           S.muted ? 'MUTED' : 'LIVE',
         ].join(' · ')
@@ -295,6 +322,24 @@
     if (typeof drawDial === 'function') drawDial();
   }
 
+
+  /** Talker status line; `waiting` shows a subtle "no audio yet" hint. */
+  function setTalkerNote(waiting) {
+    if (!S.talker) return;
+    const name = escapeHtml(S.talker.name);
+    el.stageNote.innerHTML = waiting
+      ? `<i>${name}</i> is talking <span style="opacity:.55">(connecting audio…)</span>`
+      : `<i>${name}</i> is talking`;
+  }
+
+  /** Called when a talker has been transmitting with nothing arriving. */
+  function setStaleNote(stale) {
+    if (!S.talker) return;
+    const name = escapeHtml(S.talker.name);
+    el.stageNote.innerHTML = stale
+      ? `<i>${name}</i> is keyed up <span style="color:var(--red)">— no audio arriving</span>`
+      : `<i>${name}</i> is talking`;
+  }
 
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -321,6 +366,7 @@
     try {
       localStorage.setItem('two-radio:prefs', JSON.stringify({
         callsign: S.intent.callsign, freq: S.intent.freq, color: S.intent.color,
+        mode: S.net.mode, server: S.net.server,
       }));
     } catch { /* private mode */ }
   }
@@ -331,6 +377,8 @@
       const p = JSON.parse(raw);
       if (p.callsign) el.callsign.value = p.callsign;
       if (p.freq) el.startFreq.value = normFreq(p.freq);
+      if (p.server) { S.net.server = p.server; el.localServer.value = p.server; }
+      if (p.mode === 'local' || p.mode === 'online') S.net.mode = p.mode;
       if (p.color && COLORS.includes(p.color)) {
         chosenColor = p.color;
         [...el.swatches.children].forEach((n) => n.setAttribute('aria-checked',
@@ -344,8 +392,89 @@
     return '#' + m.slice(0, 3).map((n) => Number(n).toString(16).padStart(2, '0')).join('');
   }
 
+  /* ----------------------- online / offline ----------------------- */
+  function paintMode() {
+    [...el.netModes.children].forEach((b) => {
+      b.setAttribute('aria-checked', String(b.dataset.mode === S.net.mode));
+    });
+    el.localField.hidden = S.net.mode !== 'local';
+
+    const local = S.net.mode === 'local';
+    el.linkState.classList.toggle('local-mode', local);
+    el.linkState.title = local ? 'Offline mode — same Wi-Fi only' : 'Online mode — works anywhere';
+  }
+
+  el.netModes.addEventListener('click', (e) => {
+    const btn = e.target.closest('.mode');
+    if (!btn) return;
+    S.net.mode = btn.dataset.mode;
+    if (S.net.mode === 'local' && !S.net.server) {
+      // a sane default so the field is never empty
+      el.localServer.value = el.localServer.value || '192.168.1.20:3000';
+      S.net.server = cleanHost(el.localServer.value);
+      setTimeout(() => el.localServer.focus(), 60);
+    }
+    paintMode();
+    savePrefs();
+  });
+
+  el.localServer.addEventListener('input', () => {
+    S.net.server = cleanHost(el.localServer.value);
+    savePrefs();
+  });
+
+  /** Switching network while connected: drop and rejoin on the other transport. */
+  function switchNetwork(mode) {
+    if (S.net.mode === mode) return;
+    S.net.mode = mode;
+    paintMode();
+    savePrefs();
+    if (!S.joined) return;
+
+    if (S.tx) stopTx();
+    try { S.ws && S.ws.close(); } catch { /* noop */ }
+    S.ws = null;
+    S.joined = false;
+    clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = null;
+    setLink('connecting');
+    setTimeout(connect, 150);
+  }
+
+  el.linkState.addEventListener('click', () => {
+    if (!S.joined) { el.joinSheet.hidden = false; paintMode(); return; }
+    switchNetwork(S.net.mode === 'online' ? 'local' : 'online');
+    toast(S.net.mode === 'local'
+      ? 'Offline mode — searching for the local server'
+      : 'Online mode — reconnecting to the internet server', 2600);
+  });
+
   /* --------------------------- websocket --------------------------- */
+  /** "https://192.168.1.5:3000/" -> { host: "192.168.1.5:3000", scheme: "wss" } */
+  function parseServer(raw) {
+    const s = String(raw || '').trim();
+    let scheme = null;
+    if (/^https:\/\//i.test(s)) scheme = 'wss';
+    else if (/^http:\/\//i.test(s)) scheme = 'ws';
+    const host = s
+      .replace(/^wss?:\/\//i, '')
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '')
+      .replace(/\s+/g, '');
+    return { host, scheme };
+  }
+
+  function cleanHost(raw) { return parseServer(raw).host; }
+
   function wsUrl() {
+    if (S.net.mode === 'local' && S.net.server) {
+      // Offline mode: talk to the host PC directly, no internet involved.
+      const { host, scheme } = parseServer(S.net.server);
+      // LAN mode serves HTTPS, so wss is the default. S.net.flip forces ws,
+      // which is what a plain-HTTP host needs — tried automatically on failure.
+      const proto = scheme || (S.net.flip ? 'ws' : 'wss');
+      return `${proto}://${host}/ws`;
+    }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${location.host}/ws`;
   }
@@ -379,13 +508,27 @@
       handle(msg);
     };
 
-    ws.onclose = () => {
+    ws.onerror = null;   // handled in onclose
+    ws.onclose = (ev) => {
+      const wasTalking = S.tx || S.pttDown || S.handsFree;
       S.ws = null;
       S.joined = false;
-      S.tx = false;
       S.talker = null;
+      clearInterval(S.keepalive);
+      if (wasTalking) hardStopTx(); else { S.tx = false; S.pttDown = false; }
+      // Offline mode with no explicit scheme: the host may be plain HTTP.
+      // Flip the transport once before complaining.
+      if (S.net.mode === 'local' && !parseServer(S.net.server).scheme && S.retry === 0) {
+        S.net.flip = !S.net.flip;
+      }
+
       setLink('offline');
       paintUi();
+      if (S.net.mode === 'local' && S.retry >= 1) {
+        toast(`No local server at ${cleanHost(S.net.server)} — check the address and the Wi-Fi`, 4000);
+      } else if (wasTalking) {
+        toast('Link dropped — reconnecting', 2200);
+      }
       if (S.intent.callsign) scheduleReconnect();
     };
 
@@ -394,12 +537,20 @@
 
   function scheduleReconnect() {
     if (S.reconnectTimer) return;
-    const delay = Math.min(8000, 600 * 2 ** S.retry++);
+    const delay = Math.min(6000, 300 * 2 ** S.retry++);
     setLink('offline');
     S.reconnectTimer = setTimeout(() => {
       S.reconnectTimer = null;
       if (S.intent.callsign) connect();
     }, delay);
+  }
+
+  /** Ping the server periodically: keeps proxies from culling an idle socket. */
+  function startKeepalive() {
+    clearInterval(S.keepalive);
+    S.keepalive = setInterval(() => {
+      if (S.ws && S.ws.readyState === 1) send({ t: 'ping' });
+    }, 20000);
   }
 
   function send(msg) {
@@ -426,7 +577,23 @@
           S.talker = null;
         }
         el.sheet.hidden = true;
+        S.retry = 0;                     // connected: clear the failure counter
+        startKeepalive();
         paintUi();
+
+        // If the link dropped mid-sentence, pick the sentence back up.
+        if (S.resumeTx) {
+          S.resumeTx = false;
+          const held = S.holdWhileDown;
+          const handsFree = S.resumeHandsFree;
+          S.resumeHandsFree = false;
+          if (held || handsFree) {
+            if (handsFree) S.handsFree = true;
+            setTimeout(() => {
+              if (S.joined && !S.tx) startTx();
+            }, 250);
+          }
+        }
         break;
       }
 
@@ -455,6 +622,8 @@
       case 'busy': {
         if (S.me && msg.by.id === S.me.id) break;   // our own echo
         S.talker = { id: msg.by.id, name: msg.by.name };
+        S.lastAudioAt = 0;
+        S._stale = false;
         S.tx = false;                                // half duplex: stop our output
         Receiver.begin(msg.mime);
         buzz(18);
@@ -470,6 +639,8 @@
 
       case 'audio':
         D.rx++;
+        S.lastAudioAt = Date.now();
+        if (S.talker) setTalkerNote(false);
         if (S.muted) return;
         S.vuPulse = Math.min(1, S.vuPulse + 0.45);
         Receiver.push(msg.data);
@@ -668,6 +839,7 @@
 
     function push(b64) {
       D.pushed++;
+      if (D.pushed === 1 && D.firstChunkAt === 0) D.firstChunkAt = performance.now();
       let bin;
       try { bin = atob(b64); } catch { return; }
       const bytes = new Uint8Array(bin.length);
@@ -703,6 +875,15 @@
       }
       draining = false;
       if (pending.length) queueMicrotask(drain);
+
+      // Stay at the live edge. Without this the buffer creeps forward and the
+      // delay grows into seconds over a long transmission.
+      try {
+        if (audio.buffered.length) {
+          const edge = audio.buffered.end(audio.buffered.length - 1);
+          if (edge - audio.currentTime > 0.6) audio.currentTime = edge - 0.15;
+        }
+      } catch { /* noop */ }
     }
 
     let blobTimer = null;
@@ -748,8 +929,34 @@
       close();
     }
 
+    /** Peak level of what is actually playing (0..1). */
+    function level() {
+      try {
+        if (!rxCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC) return 0;
+          rxCtx = new AC();
+          rxSource = rxCtx.createMediaElementSource(audio);
+          rxAnalyser = rxCtx.createAnalyser();
+          rxAnalyser.fftSize = 512;
+          rxSource.connect(rxAnalyser);
+          rxAnalyser.connect(rxCtx.destination);   // keep the audio audible
+        }
+        if (rxCtx.state === 'suspended') { rxCtx.resume().catch(() => {}); }
+        const buf = new Uint8Array(rxAnalyser.fftSize);
+        rxAnalyser.getByteTimeDomainData(buf);
+        let peak = 0;
+        for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+        return Math.min(1, peak * 2.4);
+      } catch {
+        return 0;      // analyser unavailable (some iOS versions): meter falls back
+      }
+    }
+
+    let rxCtx = null, rxSource = null, rxAnalyser = null;
+
     audio.addEventListener('click', unlock);
-    return { begin, push, end, unlock, element: audio };
+    return { begin, push, end, unlock, element: audio, level, get playing() { return !audio.paused; } };
   })();
 
   /* ============================================================
@@ -835,6 +1042,13 @@
     const stream = S.micStream;
     if (!stream || typeof MediaRecorder === 'undefined') return;
 
+    // A dropped link used to leave the old recorder running, so re-keying
+    // created a second recorder on the same stream and sent every slice twice.
+    if (S.recorder && S.recorder.state === 'recording') {
+      try { S.recorder.onstop = null; S.recorder.stop(); } catch { /* noop */ }
+    }
+    S.recorder = null;
+
     // meter
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -877,8 +1091,24 @@
       // stop is always followed by the release so the channel frees up
       send({ t: 'ptt', on: false });
     };
-    rec.start(250);            // ~250 ms slices = snappy relay
+    rec.start(SLICE_MS);       // short slices = low latency; see SLICE_MS
     S.recorder = rec;
+  }
+
+  /** Stop capture without touching the network. Used when the link drops. */
+  function hardStopTx() {
+    S.resumeTx = !!(S.pttDown || S.handsFree || S.holdWhileDown);
+    S.wasHandsFree = S.handsFree;
+    const rec = S.recorder;
+    S.recorder = null;
+    if (rec) {
+      try { rec.onstop = null; rec.stop(); } catch { /* noop */ }
+    }
+    S.tx = false;
+    S.pttDown = false;
+    S.handsFree = false;
+    if (S.wasHandsFree) S.resumeHandsFree = true;
+    paintUi();
   }
 
   function stopTx() {
@@ -926,10 +1156,14 @@
     }
 
     pressStartedTx = true;
+    S.holdWhileDown = true;
     startTx();
   }
 
   function pttUp() {
+    S.holdWhileDown = false;
+    S.resumeTx = false;
+    S.resumeHandsFree = false;
     if (!pressStartedTx) return;
     pressStartedTx = false;
     if (S.handsFree) return;          // stay on air
@@ -1205,6 +1439,16 @@
     const freq = normFreq(el.startFreq.value);
     if (!callsign) { el.callsign.focus(); return; }
 
+    if (S.net.mode === 'local') {
+      S.net.server = cleanHost(el.localServer.value);
+      if (!S.net.server) {
+        toast('Enter the local server address printed by the host PC', 3200);
+        el.localServer.focus();
+        return;
+      }
+      el.localServer.value = S.net.server;
+    }
+
     const sameChannel = S.joined && S.freq === freq;
     el.startFreq.value = freq;
     S.freq = freq;
@@ -1266,6 +1510,8 @@
   });
 
   el.startFreq.value = normFreq(el.startFreq.value || '446.00625');
+  if (S.net.server) el.localServer.value = S.net.server;
+  paintMode();
 
   paintUi();
   vuLoop();
@@ -1296,4 +1542,24 @@
     if (document.hidden && S.tx) stopTx();
   });
   window.addEventListener('pagehide', () => { if (S.tx) stopTx(); });
+
+  // Close the socket deliberately when the page goes away, so the server removes
+  // this operator immediately instead of keeping a ghost until the next sweep.
+  function dropConnection() {
+    if (S.recorder) { try { S.recorder.stop(); } catch { /* noop */ } S.recorder = null; }
+    S.tx = false;
+    S.handsFree = false;
+    clearTimeout(S.reconnectTimer);
+    S.reconnectTimer = null;
+    const ws = S.ws;
+    S.ws = null;
+    S.joined = false;
+    if (ws) {
+      try { ws.send(JSON.stringify({ t: 'bye' })); } catch { /* noop */ }
+      try { ws.close(1000, 'leaving'); } catch { /* noop */ }
+    }
+  }
+
+  window.addEventListener('pagehide', dropConnection);
+  window.addEventListener('beforeunload', dropConnection);
 })();
